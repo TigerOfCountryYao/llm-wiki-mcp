@@ -27,6 +27,7 @@ const consentSchema = z
   .object({
     schemaVersion: z.literal(STATE_SCHEMA_VERSION),
     selectedPaths: z.array(z.string()),
+    scopeMode: z.enum(["git", "filesystem"]).optional(),
     confirmedAt: z.iso.datetime(),
   })
   .strict();

@@ -148,4 +148,85 @@ describe("source scope", () => {
       }
     }
   });
+
+  it("never treats a bare Git repository as a non-Git source tree", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-bare-git-"));
+    roots.push(root);
+    await execFileAsync("git", ["init", "--bare", "--quiet", root]);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, "docs", "private.md"), "not a worktree\n");
+
+    await expect(catalogProject(root)).rejects.toMatchObject({
+      code: "GIT_SCOPE_UNAVAILABLE",
+    });
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      await expect(catalogProject(root)).rejects.toMatchObject({
+        code: "GIT_SCOPE_UNAVAILABLE",
+      });
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+    }
+  });
+
+  it("binds consent to Git filtering when repository metadata later disappears", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-git-scope-mode-"));
+    roots.push(root);
+    await execFileAsync("git", ["init", "--quiet", root]);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, ".gitignore"), "docs/private.secret\n");
+    await writeFile(path.join(root, "docs", "guide.md"), "approved knowledge\n");
+    await writeFile(path.join(root, "docs", "private.secret"), "must stay excluded\n");
+
+    await initializeProject(root, ["docs"]);
+    const consent = await readConsent(root);
+    expect(consent.scopeMode).toBe("git");
+    await rm(path.join(root, ".git"), { recursive: true, force: true });
+
+    await expect(enumerateAuthorizedSources(root, consent)).rejects.toMatchObject({
+      code: "SOURCE_SCOPE_CHANGED",
+    });
+    await expect(
+      buildProject(root, { engine: new DeterministicSourceEngine() }),
+    ).rejects.toMatchObject({ code: "SOURCE_SCOPE_CHANGED" });
+  });
+
+  it("requires renewed consent when a filesystem source becomes a Git worktree", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-filesystem-scope-mode-"));
+    roots.push(root);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, "docs", "guide.md"), "local knowledge\n");
+
+    await initializeProject(root, ["docs"]);
+    const consent = await readConsent(root);
+    expect(consent.scopeMode).toBe("filesystem");
+    await execFileAsync("git", ["init", "--quiet", root]);
+
+    await expect(enumerateAuthorizedSources(root, consent)).rejects.toMatchObject({
+      code: "SOURCE_SCOPE_CHANGED",
+    });
+  });
+
+  it("requires renewed consent for legacy state without a recorded scope strategy", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-legacy-scope-mode-"));
+    roots.push(root);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, "docs", "guide.md"), "local knowledge\n");
+    await initializeProject(root, ["docs"]);
+    const consentPath = path.join(root, ".llm-wiki", "consent.json");
+    const raw = JSON.parse(await readFile(consentPath, "utf8")) as Record<string, unknown>;
+    delete raw["scopeMode"];
+    await writeFile(consentPath, `${JSON.stringify(raw)}\n`);
+    const consent = await readConsent(root);
+
+    await expect(enumerateAuthorizedSources(root, consent)).rejects.toMatchObject({
+      code: "SOURCE_SCOPE_RECONFIRM_REQUIRED",
+    });
+  });
 });

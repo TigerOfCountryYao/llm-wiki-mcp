@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -176,6 +184,72 @@ describe("immutable generation builds", () => {
       }
     }
   }, 15_000);
+
+  it("serializes concurrent contenders while reclaiming one orphaned lock", async () => {
+    const root = await projectWithSource();
+    await buildProject(root, { engine: new DeterministicSourceEngine() });
+    const lockPath = path.join(root, ".llm-wiki", "locks", "build.lock");
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({
+        pid: 2_147_483_647,
+        token: "orphaned-test-lock",
+        createdAt: new Date().toISOString(),
+      })}\n`,
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    let notifyStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const slow: WikiEngine = {
+      async build(input): Promise<EngineBuildResult> {
+        started += 1;
+        notifyStarted();
+        await gate;
+        return new DeterministicSourceEngine().build(input);
+      },
+    };
+
+    const outcomesPromise = Promise.allSettled([
+      buildProject(root, { engine: slow }),
+      buildProject(root, { engine: slow }),
+    ]);
+    await firstStarted;
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({
+      pid: process.pid,
+    });
+    release();
+    const outcomes = await outcomesPromise;
+
+    expect(started).toBe(1);
+    expect(outcomes.filter((item) => item.status === "fulfilled")).toHaveLength(1);
+    const rejected = outcomes.find((item) => item.status === "rejected");
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: { code: "BUILD_LOCKED" },
+    });
+  });
+
+  it("reclaims a stale recovery guard left by a process crash", async () => {
+    const root = await projectWithSource();
+    await buildProject(root, { engine: new DeterministicSourceEngine() });
+    const lockPath = path.join(root, ".llm-wiki", "locks", "build.lock");
+    const guardPath = `${lockPath}.recovery`;
+    await mkdir(guardPath);
+    const staleTime = new Date(Date.now() - 10_000);
+    await utimes(guardPath, staleTime, staleTime);
+
+    await expect(
+      buildProject(root, { engine: new DeterministicSourceEngine() }),
+    ).resolves.toMatchObject({ sourceCount: 1 });
+    await expect(readdir(guardPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
 
   it("releases the build lock when current state cannot be read", async () => {
     const root = await projectWithSource();

@@ -9,9 +9,16 @@ import { LlmWikiError } from "./errors.js";
 import { ensurePrivateDirectory, pathExists } from "./fs-utils.js";
 import { installLocalExclude, uninstallLocalExclude } from "./git.js";
 import { projectPaths } from "./paths.js";
-import { catalogProject, validateSelectedPaths } from "./scope.js";
+import {
+  catalogProject,
+  validateSelectedPathsFromCatalog,
+} from "./scope.js";
 import { writeStatus } from "./state.js";
-import { STATE_SCHEMA_VERSION, type ProjectConfig } from "./types.js";
+import {
+  STATE_SCHEMA_VERSION,
+  type ProjectConfig,
+  type SourceScopeMode,
+} from "./types.js";
 
 export async function initializeProject(
   root: string,
@@ -19,6 +26,7 @@ export async function initializeProject(
 ): Promise<{
   root: string;
   selectedPaths: string[];
+  scopeMode: SourceScopeMode;
   gitExclude: {
     changed: boolean;
     path: string | null;
@@ -30,7 +38,7 @@ export async function initializeProject(
     requestedSelections === undefined
       ? catalog.entries.filter((entry) => entry.selected).map((entry) => entry.path)
       : requestedSelections;
-  const selectedPaths = await validateSelectedPaths(root, rawSelections);
+  const selectedPaths = validateSelectedPathsFromCatalog(catalog, rawSelections);
   if (selectedPaths.length === 0) {
     throw new LlmWikiError(
       "EMPTY_SOURCE_SCOPE",
@@ -57,6 +65,7 @@ export async function initializeProject(
   await writeConsent(root, {
     schemaVersion: STATE_SCHEMA_VERSION,
     selectedPaths,
+    scopeMode: catalog.scopeMode,
     confirmedAt: new Date().toISOString(),
   });
   await writeStatus(root, {
@@ -68,7 +77,7 @@ export async function initializeProject(
   });
 
   const gitExclude = await installLocalExclude(root);
-  return { root, selectedPaths, gitExclude };
+  return { root, selectedPaths, scopeMode: catalog.scopeMode, gitExclude };
 }
 
 export async function uninitializeProject(root: string): Promise<{

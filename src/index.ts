@@ -68,5 +68,6 @@ export type {
   SemanticIndex,
   SemanticIndexEntry,
   SourceLocator,
+  SourceScopeMode,
   WikiEngine,
 } from "./types.js";

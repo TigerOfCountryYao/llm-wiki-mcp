@@ -20,6 +20,7 @@ import type {
   ConsentFile,
   EnumeratedSource,
   ManagedKnowledge,
+  SourceScopeMode,
 } from "./types.js";
 
 export async function catalogProject(root: string): Promise<CatalogResult> {
@@ -50,12 +51,20 @@ export async function catalogProject(root: string): Promise<CatalogResult> {
   return {
     root,
     initialized: consent !== null,
+    scopeMode: scopeModeFor(gitFiles),
     entries,
   };
 }
 
 export async function validateSelectedPaths(root: string, selected: string[]): Promise<string[]> {
   const catalog = await catalogProject(root);
+  return validateSelectedPathsFromCatalog(catalog, selected);
+}
+
+export function validateSelectedPathsFromCatalog(
+  catalog: CatalogResult,
+  selected: string[],
+): string[] {
   const byCanonical = new Map(
     catalog.entries.map((entry) => [canonicalPath(entry.path), entry.path] as const),
   );
@@ -87,6 +96,19 @@ export async function enumerateAuthorizedSources(
     effectivePaths.map(canonicalPath),
   );
   const gitFiles = await gitEligibleFiles(root);
+  const currentScopeMode = scopeModeFor(gitFiles);
+  if (consent.scopeMode === undefined) {
+    throw new LlmWikiError(
+      "SOURCE_SCOPE_RECONFIRM_REQUIRED",
+      "The source filtering strategy was not recorded; re-run initialization to confirm the source scope.",
+    );
+  }
+  if (consent.scopeMode !== currentScopeMode) {
+    throw new LlmWikiError(
+      "SOURCE_SCOPE_CHANGED",
+      `The source filtering strategy changed from ${consent.scopeMode} to ${currentScopeMode}; re-run initialization to confirm the new scope.`,
+    );
+  }
   const relativeFiles =
     gitFiles === null
       ? await enumerateNonGitSelected(root, effectivePaths)
@@ -273,6 +295,10 @@ function isAuthorizedFile(relativePath: string, selected: Set<string>): boolean 
 
 function canonicalPath(value: string): string {
   return process.platform === "win32" ? value.toLocaleLowerCase("en-US") : value;
+}
+
+function scopeModeFor(gitFiles: string[] | null): SourceScopeMode {
+  return gitFiles === null ? "filesystem" : "git";
 }
 
 function managedToSource(knowledge: ManagedKnowledge): EnumeratedSource {

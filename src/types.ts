@@ -2,6 +2,7 @@ export const PROJECT_SCHEMA_VERSION = 1 as const;
 export const STATE_SCHEMA_VERSION = 1 as const;
 
 export type SourceKind = "file" | "knowledge" | "unsupported";
+export type SourceScopeMode = "git" | "filesystem";
 
 export type FileLocator = {
   kind: "file";
@@ -123,6 +124,7 @@ export interface ProjectConfig {
 export interface ConsentFile {
   schemaVersion: typeof STATE_SCHEMA_VERSION;
   selectedPaths: string[];
+  scopeMode?: SourceScopeMode | undefined;
   confirmedAt: string;
 }
 
@@ -162,6 +164,7 @@ export interface CatalogEntry {
 export interface CatalogResult {
   root: string;
   initialized: boolean;
+  scopeMode: SourceScopeMode;
   entries: CatalogEntry[];
 }
 

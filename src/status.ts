@@ -7,7 +7,7 @@ import {
 import { projectPaths } from "./paths.js";
 import { readConsent } from "./config.js";
 import { enumerateAuthorizedSources } from "./scope.js";
-import { readCurrent, readStoredStatus, writeStatus } from "./state.js";
+import { readCurrent, readStoredStatus } from "./state.js";
 import {
   STATE_SCHEMA_VERSION,
   type GenerationManifest,
@@ -66,7 +66,6 @@ export async function getProjectStatus(
           ? {}
           : { currentGeneration: current.generation }),
       };
-      await writeStatus(root, stored);
     }
   }
   const enumerated =

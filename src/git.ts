@@ -28,11 +28,17 @@ export async function isGitWorkTree(root: string): Promise<boolean> {
   try {
     const result = await git(root, ["rev-parse", "--is-inside-work-tree"]);
     const insideWorkTree = String(result).trim() === "true";
-    if (!insideWorkTree && metadataPresent) {
+    if (!insideWorkTree) {
       throw gitScopeUnavailable();
     }
     return insideWorkTree;
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof LlmWikiError &&
+      error.code === "GIT_SCOPE_UNAVAILABLE"
+    ) {
+      throw error;
+    }
     if (metadataPresent) {
       throw gitScopeUnavailable();
     }
@@ -81,12 +87,35 @@ async function hasGitMetadata(root: string): Promise<boolean> {
         throw gitScopeUnavailable();
       }
     }
+    if (await hasBareGitMetadata(current)) {
+      return true;
+    }
     const parent = path.dirname(current);
     if (parent === current) {
       return false;
     }
     current = parent;
   }
+}
+
+async function hasBareGitMetadata(directory: string): Promise<boolean> {
+  const entries = await Promise.all(
+    ["HEAD", "objects", "refs"].map(async (name) => {
+      try {
+        return await lstat(path.join(directory, name));
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return null;
+        }
+        throw gitScopeUnavailable();
+      }
+    }),
+  );
+  return Boolean(
+    entries[0]?.isFile() &&
+    entries[1]?.isDirectory() &&
+    entries[2]?.isDirectory(),
+  );
 }
 
 function gitScopeUnavailable(): LlmWikiError {

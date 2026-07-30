@@ -42,9 +42,14 @@ starts with `.` and every Git-ignored file are excluded.
 If Git metadata is present but Git cannot verify the repository scope,
 cataloging, status verification, and builds fail closed with
 `GIT_SCOPE_UNAVAILABLE`; they never fall back to broader filesystem traversal.
+Consent also records whether Git or filesystem filtering was confirmed. If that
+strategy later changes, source enumeration stops with `SOURCE_SCOPE_CHANGED`
+until the user re-runs `init`. State created before this field existed must
+likewise be reconfirmed once (`SOURCE_SCOPE_RECONFIRM_REQUIRED`).
 If a build process is interrupted, the next status check reclaims its
 dead-owner lock and reports `BUILD_INTERRUPTED`, so rebuilding can resume
-immediately.
+automatically. Lock recovery is serialized with a cross-platform process lock,
+including recovery from a process that exits during the recovery operation.
 
 Interactive `init` uses a first-level checklist: Up/Down moves, Space toggles,
 Enter confirms, and Escape cancels. Non-interactive callers must pass both

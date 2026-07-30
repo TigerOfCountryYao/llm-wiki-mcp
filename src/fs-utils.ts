@@ -1,8 +1,8 @@
 import {
   chmod,
+  link,
   lstat,
   mkdir,
-  open,
   readFile,
   readdir,
   realpath,
@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import * as properLockfile from "proper-lockfile";
 import { LlmWikiError } from "./errors.js";
 
 export async function pathExists(target: string): Promise<boolean> {
@@ -181,41 +182,50 @@ export interface FileLock {
 
 export type FileLockState = "absent" | "active" | "recovered";
 
+const RECOVERY_GUARD_STALE_MS = 2_000;
+
 export async function acquireFileLock(
   lockPath: string,
   staleAfterMs = 30 * 60 * 1000,
 ): Promise<FileLock> {
   await ensurePrivateDirectory(path.dirname(lockPath));
+  const recoveryGuard = await acquireRecoveryGuard(lockPath);
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const token = randomUUID();
+        await createLockFileExclusive(lockPath, {
+          pid: process.pid,
+          token,
+          createdAt: new Date().toISOString(),
+        });
+        let released = false;
+        return {
+          async release(): Promise<void> {
+            if (released) {
+              return;
+            }
+            released = true;
+            await removeOwnedLock(lockPath, token);
+          },
+        };
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "EEXIST") {
+          throw error;
+        }
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const handle = await open(lockPath, "wx", 0o600);
-      await handle.writeFile(
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
-        "utf8",
-      );
-      await handle.close();
-      let released = false;
-      return {
-        async release(): Promise<void> {
-          if (released) {
-            return;
-          }
-          released = true;
-          await rm(lockPath, { force: true });
-        },
-      };
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== "EEXIST") {
-        throw error;
+        const state = await recoverOrphanedFileLockUnlocked(
+          lockPath,
+          staleAfterMs,
+        );
+        if (attempt === 0 && state !== "active") {
+          continue;
+        }
+        throw new LlmWikiError("BUILD_LOCKED", "Another LLM Wiki build is already running.");
       }
-
-      const state = await recoverOrphanedFileLock(lockPath, staleAfterMs);
-      if (attempt === 0 && state !== "active") {
-        continue;
-      }
-      throw new LlmWikiError("BUILD_LOCKED", "Another LLM Wiki build is already running.");
     }
+  } finally {
+    await recoveryGuard.release();
   }
 
   throw new LlmWikiError("BUILD_LOCKED", "Another LLM Wiki build is already running.");
@@ -224,6 +234,18 @@ export async function acquireFileLock(
 export async function recoverOrphanedFileLock(
   lockPath: string,
   staleAfterMs = 30 * 60 * 1000,
+): Promise<FileLockState> {
+  const recoveryGuard = await acquireRecoveryGuard(lockPath);
+  try {
+    return await recoverOrphanedFileLockUnlocked(lockPath, staleAfterMs);
+  } finally {
+    await recoveryGuard.release();
+  }
+}
+
+async function recoverOrphanedFileLockUnlocked(
+  lockPath: string,
+  staleAfterMs: number,
 ): Promise<FileLockState> {
   let lockStat;
   try {
@@ -244,22 +266,113 @@ export async function recoverOrphanedFileLock(
   return "active";
 }
 
-async function lockOwnerIsAlive(lockPath: string): Promise<boolean | null> {
+async function acquireRecoveryGuard(lockPath: string): Promise<FileLock> {
+  const guardPath = `${lockPath}.recovery`;
   try {
-    const raw = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
+    const release = await properLockfile.lock(lockPath, {
+      realpath: false,
+      lockfilePath: guardPath,
+      stale: RECOVERY_GUARD_STALE_MS,
+      update: RECOVERY_GUARD_STALE_MS / 2,
+      retries: {
+        retries: 50,
+        factor: 1,
+        minTimeout: 50,
+        maxTimeout: 50,
+        randomize: true,
+      },
+    });
+    let released = false;
+    return {
+      async release(): Promise<void> {
+        if (released) {
+          return;
+        }
+        released = true;
+        await release();
+      },
+    };
+  } catch (error) {
+    throw new LlmWikiError(
+      "BUILD_LOCKED",
+      "LLM Wiki lock recovery is already in progress.",
+      error,
+    );
+  }
+}
+
+async function createLockFileExclusive(
+  lockPath: string,
+  record: { pid: number; token: string; createdAt: string },
+): Promise<void> {
+  const temporary = `${lockPath}.${record.token}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(record)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+  try {
+    await link(temporary, lockPath);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function removeOwnedLock(
+  lockPath: string,
+  expectedToken: string,
+): Promise<void> {
+  try {
+    const raw = JSON.parse(await readFile(lockPath, "utf8")) as {
+      token?: unknown;
+    };
+    if (raw.token === expectedToken) {
+      await rm(lockPath, { force: true });
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function lockOwnerIsAlive(lockPath: string): Promise<boolean | null> {
+  const record = await readLockRecord(lockPath);
+  if (record === null) {
+    return null;
+  }
+  return processIdIsAlive(record.pid);
+}
+
+async function readLockRecord(
+  lockPath: string,
+): Promise<{ pid: number; token: string | null } | null> {
+  try {
+    const raw = JSON.parse(await readFile(lockPath, "utf8")) as {
+      pid?: unknown;
+      token?: unknown;
+    };
     if (typeof raw.pid !== "number" || !Number.isInteger(raw.pid) || raw.pid <= 0) {
       return null;
     }
-    try {
-      process.kill(raw.pid, 0);
-      return true;
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ESRCH") {
-        return false;
-      }
-      return true;
-    }
+    return {
+      pid: raw.pid,
+      token: typeof raw.token === "string" ? raw.token : null,
+    };
   } catch {
     return null;
+  }
+}
+
+function processIdIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ESRCH") {
+      return false;
+    }
+    return true;
   }
 }
