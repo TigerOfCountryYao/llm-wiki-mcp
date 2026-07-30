@@ -9,14 +9,17 @@ export {
 export { doctorProject, type DoctorCheck } from "./doctor.js";
 export { LlmWikiError } from "./errors.js";
 export {
-  buildSemanticIndex,
   createEmbeddingClient,
   embeddingProfileFingerprint,
-  rankSemanticIndex,
-  readSemanticIndex,
   type EmbeddingClient,
   type EmbeddingClientFactory,
 } from "./embedding.js";
+export {
+  buildSemanticIndex,
+  rankSemanticIndex,
+  readSemanticIndex,
+  type SemanticIndexIdentity,
+} from "./semantic-cache.js";
 export { exploreWiki, type ExploreOptions } from "./explore.js";
 export {
   deleteKnowledge,

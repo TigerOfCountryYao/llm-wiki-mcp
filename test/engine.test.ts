@@ -21,10 +21,22 @@ const ingestText = vi.fn(async () => ({
   writeStatus: "created" as const,
 }));
 const deleteSource = vi.fn(async () => true);
-const listPages = vi.fn(async () => ({
+interface ListPageOptions {
+  cursor?: string;
+  profileCursor?: string;
+}
+
+const defaultEntityPages = Array.from({ length: 3 }, (_, index) => ({
+  id: `entity-${index}`,
+  path: `entities/entity-${index}.md`,
+  slug: `entity-${index}`,
+  title: `Entity ${index}`,
+  body: `Entity body ${index}`,
+}));
+const listPages = vi.fn(async (_options?: ListPageOptions) => ({
   pages: [{ slug: "one" }, { slug: "two" }],
   profile: {
-    entityPages: [],
+    entityPages: defaultEntityPages,
     total: 3,
   },
 }));
@@ -53,7 +65,7 @@ beforeEach(() => {
   listPages.mockResolvedValue({
     pages: [{ slug: "one" }, { slug: "two" }],
     profile: {
-      entityPages: [],
+      entityPages: defaultEntityPages,
       total: 3,
     },
   });
@@ -112,6 +124,18 @@ describe("compiler adapter", () => {
       },
     ]);
     expect(result.pageCount).toBe(5);
+    expect(result.compiledPages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          pageId: "concepts/one",
+          relativePath: "wiki/concepts/one.md",
+        }),
+        expect.objectContaining({
+          pageId: "entity-0",
+          relativePath: "entities/entity-0.md",
+        }),
+      ]),
+    );
     expect(process.env["OPENAI_API_KEY"]).not.toBe("generation-secret");
   });
 
@@ -200,6 +224,67 @@ describe("compiler adapter", () => {
         delete process.env["OPENAI_API_KEY"];
       }
     }
+  });
+
+  it("collects every legacy and profile page through their independent cursors", async () => {
+    const { CompilerWikiEngine } = await import("../src/engine.js");
+    const legacy = Array.from({ length: 101 }, (_, index) => ({
+      slug: `legacy-${index}`,
+      body: `Legacy ${index}`,
+    }));
+    const entities = Array.from({ length: 101 }, (_, index) => ({
+      id: `entity-${index}`,
+      path: `entities/entity-${index}.md`,
+      slug: `entity-${index}`,
+      title: `Entity ${index}`,
+      body: `Entity ${index}`,
+    }));
+    listPages.mockImplementation(async (options?: ListPageOptions) => {
+      const legacyOffset = Number(options?.cursor ?? 0);
+      const profileOffset = Number(options?.profileCursor ?? 0);
+      return {
+        pages: legacy.slice(legacyOffset, legacyOffset + 100),
+        ...(legacyOffset + 100 < legacy.length
+          ? { cursor: String(legacyOffset + 100) }
+          : {}),
+        profile: {
+          entityPages: entities.slice(profileOffset, profileOffset + 100),
+          total: entities.length,
+          ...(profileOffset + 100 < entities.length
+            ? { cursor: String(profileOffset + 100) }
+            : {}),
+        },
+      };
+    });
+    const engine = new CompilerWikiEngine(
+      {
+        name: "generation",
+        kind: "openai-compatible",
+        model: "model",
+        credential: { store: "env", envName: "TEST_GENERATION_KEY" },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      "generation-secret",
+    );
+
+    const result = await engine.build({
+      generationRoot: "unused",
+      proxies: [],
+    });
+
+    expect(result.pageCount).toBe(202);
+    expect(result.compiledPages).toHaveLength(202);
+    expect(listPages).toHaveBeenCalledWith({
+      includeBody: true,
+      limit: 100,
+      cursor: "100",
+    });
+    expect(listPages).toHaveBeenCalledWith({
+      includeBody: true,
+      limit: 100,
+      profileCursor: "100",
+    });
   });
 
   it.each([

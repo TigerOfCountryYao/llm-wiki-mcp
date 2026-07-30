@@ -221,6 +221,36 @@ export interface ProxyRecord {
   bodyHash: string;
 }
 
+export interface CompiledWikiPageCitation {
+  proxyId: string;
+  engineStartLine?: number;
+  engineEndLine?: number;
+  pageLineIndex?: number;
+}
+
+export interface CompiledWikiPageRecord {
+  pageId: string;
+  relativePath: string;
+  title: string;
+  contentHash: string;
+  citations: CompiledWikiPageCitation[];
+}
+
+export interface IncrementalPageCandidate {
+  pageId: string;
+  relativePath: string;
+  title: string;
+  retrieval: "lexical" | "semantic" | "lexical+semantic";
+  score: number;
+}
+
+export interface EngineCompiledWikiPage {
+  pageId: string;
+  relativePath: string;
+  title: string;
+  body: string;
+}
+
 export interface GenerationManifest {
   schemaVersion: typeof STATE_SCHEMA_VERSION;
   generation: string;
@@ -241,12 +271,15 @@ export interface GenerationManifest {
   }>;
   unsupported: UnsupportedSource[];
   proxies: ProxyRecord[];
+  /** Added in 0.1.5. Older generations are catalogued from compiled Markdown. */
+  pages?: CompiledWikiPageRecord[];
 }
 
 export interface EngineBuildInput {
   generationRoot: string;
   proxies: ProxyRecord[];
   previousProxies?: ProxyRecord[];
+  previousPageCandidates?: IncrementalPageCandidate[];
 }
 
 export interface EngineBuildResult {
@@ -258,6 +291,7 @@ export interface EngineBuildResult {
     engineSourceFile: string;
     engineBodyStartLine: number;
   }>;
+  compiledPages?: EngineCompiledWikiPage[];
 }
 
 export interface WikiEngine {
@@ -294,8 +328,8 @@ export interface ExploreResult {
 }
 
 export interface SemanticIndexEntry {
-  proxyId: string;
-  bodyHash: string;
+  pageId: string;
+  contentHash: string;
   segmentIndex: number;
   startLineIndex: number;
   endLineIndex: number;

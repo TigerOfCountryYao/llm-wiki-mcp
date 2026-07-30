@@ -1,4 +1,12 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,12 +24,18 @@ import { doctorProject } from "../src/doctor.js";
 import { DeterministicSourceEngine } from "../src/engine.js";
 import { LlmWikiError } from "../src/errors.js";
 import { exploreWiki } from "../src/explore.js";
+import { catalogCompiledWikiPages } from "../src/pages.js";
+import { projectPaths } from "../src/paths.js";
 import { initializeProject } from "../src/project.js";
+import { readSemanticIndex } from "../src/semantic-cache.js";
 import { getProjectStatus } from "../src/status.js";
 import type {
+  EngineBuildInput,
+  EngineBuildResult,
   GenerationManifest,
   ProviderProfile,
   ProviderProfilesFile,
+  WikiEngine,
 } from "../src/types.js";
 
 const roots: string[] = [];
@@ -33,6 +47,399 @@ afterEach(async () => {
 });
 
 describe("semantic build boundary", () => {
+  it("sends compiled Wiki pages, never proxy inputs, to document embeddings", async () => {
+    const fixture = await semanticProject();
+    const rawMarker = "RAW-SOURCE-ONLY-MARKER-9f7c";
+    const compiledMarker = "COMPILED-WIKI-ONLY-MARKER-31ab";
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      `${rawMarker}\n`,
+    );
+    const observedDocuments: string[] = [];
+    const engine = new CompiledPageEngine([
+      {
+        pageId: "concepts/compiled-summary",
+        title: "Compiled summary",
+        body: compiledMarker,
+      },
+    ]);
+
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory(observedDocuments),
+    });
+
+    expect(observedDocuments.join("\n")).toContain(compiledMarker);
+    expect(observedDocuments.join("\n")).not.toContain(rawMarker);
+    const explored = await exploreWiki(fixture.root, compiledMarker, {
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory([]),
+    });
+    expect(explored.evidence[0]?.snippet).toContain(compiledMarker);
+    expect(JSON.stringify(explored.evidence)).not.toContain(rawMarker);
+  });
+
+  it("uses semantic recall to select old Wiki pages for an incremental build", async () => {
+    const fixture = await semanticProject();
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      "initial evidence with no legacy page wording\n",
+    );
+    const engine = new CompiledPageEngine([
+      {
+        pageId: "concepts/legacy-checkout",
+        title: "Legacy checkout coordinator",
+        body: "Historical coordinator details.",
+      },
+    ]);
+    const factory = directionalSemanticFactory();
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: factory,
+    });
+
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      "跨语言结算编排新证据 semantic-recall-probe\n",
+    );
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: factory,
+    });
+
+    const candidates = engine.inputs[1]?.previousPageCandidates ?? [];
+    expect(candidates).toContainEqual(
+      expect.objectContaining({
+        pageId: "concepts/legacy-checkout",
+        retrieval: expect.stringMatching(/semantic/u),
+      }),
+    );
+  });
+
+  it("circuit-breaks remaining semantic requests after an incremental query failure", async () => {
+    const fixture = await semanticProject();
+    const engine = new CompiledPageEngine([
+      {
+        pageId: "concepts/circuit-page",
+        title: "Circuit page",
+        body: "Previously compiled circuit content.",
+      },
+    ]);
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory([]),
+    });
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      "changed evidence that starts an incremental lookup\n",
+    );
+    let documentCalls = 0;
+    let queryCalls = 0;
+    const failingFactory: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        documentCalls += 1;
+        return inputs.map(() => [1, 0]);
+      },
+      async embedQuery() {
+        queryCalls += 1;
+        throw new LlmWikiError(
+          "EMBEDDING_NETWORK_FAILED",
+          "The embedding provider could not be reached.",
+        );
+      },
+    });
+
+    const built = await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: failingFactory,
+    });
+    const manifest = JSON.parse(
+      await readFile(
+        path.join(
+          fixture.root,
+          ".llm-wiki",
+          "generations",
+          built.generation,
+          "manifest.json",
+        ),
+        "utf8",
+      ),
+    ) as GenerationManifest;
+    expect(queryCalls).toBe(1);
+    expect(documentCalls).toBe(0);
+    expect(manifest.semantic).toMatchObject({
+      available: false,
+      reasonCode: "EMBEDDING_NETWORK_FAILED",
+    });
+  });
+
+  it("does not disguise an incremental implementation bug as provider fallback", async () => {
+    const fixture = await semanticProject();
+    const engine = new CompiledPageEngine([
+      {
+        pageId: "concepts/incremental-bug",
+        title: "Incremental bug",
+        body: "Historical compiled evidence.",
+      },
+    ]);
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory([]),
+    });
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      "changed evidence that triggers incremental recall\n",
+    );
+    const buggyFactory: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        return inputs.map(() => [1, 0]);
+      },
+      async embedQuery() {
+        throw new Error("unexpected injected implementation failure");
+      },
+    });
+
+    await expect(
+      buildProject(fixture.root, {
+        engine,
+        environment: fixture.environment,
+        embeddingClientFactory: buggyFactory,
+      }),
+    ).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
+  });
+
+  it("rebuilds the page cache when a provider changes vector dimensions", async () => {
+    const fixture = await semanticProject();
+    const engine = new CompiledPageEngine([
+      {
+        pageId: "concepts/dimension-drift",
+        title: "Dimension drift",
+        body: "Compiled dimension evidence.",
+      },
+    ]);
+    const twoDimensions: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        return inputs.map(() => [1, 0]);
+      },
+      async embedQuery() {
+        return [1, 0];
+      },
+    });
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: twoDimensions,
+    });
+    await writeFile(
+      path.join(fixture.root, "docs", "target.md"),
+      "changed evidence triggers the old two-dimensional cache\n",
+    );
+    let rebuiltDocuments = 0;
+    const threeDimensions: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        rebuiltDocuments += inputs.length;
+        return inputs.map(() => [1, 0, 0]);
+      },
+      async embedQuery() {
+        return [1, 0, 0];
+      },
+    });
+
+    const result = await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: threeDimensions,
+    });
+    const manifest = JSON.parse(
+      await readFile(
+        path.join(
+          fixture.root,
+          ".llm-wiki",
+          "generations",
+          result.generation,
+          "manifest.json",
+        ),
+        "utf8",
+      ),
+    ) as GenerationManifest;
+    const explored = await exploreWiki(fixture.root, "dimension evidence", {
+      environment: fixture.environment,
+      embeddingClientFactory: threeDimensions,
+    });
+
+    expect(rebuiltDocuments).toBeGreaterThan(0);
+    expect(manifest.semantic.available).toBe(true);
+    expect(explored.status.semantic).toBe("available");
+  });
+
+  it("persists completed page batches and resumes after a provider failure", async () => {
+    const fixture = await semanticProject();
+    const pages = Array.from({ length: 9 }, (_, index) => ({
+      pageId: `concepts/page-${String(index).padStart(2, "0")}`,
+      title: `Page ${index}`,
+      body: `Compiled page batch marker ${index}.`,
+    }));
+    const engine = new CompiledPageEngine(pages);
+    let firstBuildBatch = 0;
+    const firstFactory: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        firstBuildBatch += 1;
+        if (firstBuildBatch === 2) {
+          throw new LlmWikiError(
+            "EMBEDDING_NETWORK_FAILED",
+            "The embedding provider could not be reached.",
+          );
+        }
+        return inputs.map(() => [1, 0]);
+      },
+      async embedQuery() {
+        return [1, 0];
+      },
+    });
+    const first = await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: firstFactory,
+    });
+    const firstManifest = JSON.parse(
+      await readFile(
+        path.join(
+          fixture.root,
+          ".llm-wiki",
+          "generations",
+          first.generation,
+          "manifest.json",
+        ),
+        "utf8",
+      ),
+    ) as GenerationManifest;
+    expect(firstBuildBatch).toBe(2);
+    expect(firstManifest.semantic.available).toBe(false);
+    const firstGenerationRoot = path.join(
+      fixture.root,
+      ".llm-wiki",
+      "generations",
+      first.generation,
+    );
+    const partialPages = await catalogCompiledWikiPages(
+      firstGenerationRoot,
+      firstManifest.proxies,
+      new Set(firstManifest.sources.map((source) => source.sourceId)),
+      undefined,
+      firstManifest.pages,
+    );
+    await expect(
+      readSemanticIndex(
+        projectPaths(fixture.root).semanticIndex,
+        partialPages,
+        {
+          profile: "embedding",
+          kind: "voyage",
+          model: "voyage-3",
+          profileFingerprint: firstManifest.semantic.profileFingerprint!,
+        },
+      ),
+    ).resolves.toBeNull();
+
+    const resumedDocuments: string[] = [];
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory(resumedDocuments),
+    });
+    expect(resumedDocuments).toHaveLength(1);
+    expect(resumedDocuments[0]).toContain("Compiled page batch marker 8.");
+    expect(resumedDocuments[0]).not.toContain("Compiled page batch marker 7.");
+  });
+
+  it("keeps completed page batches when a build is cancelled", async () => {
+    const fixture = await semanticProject();
+    const pages = Array.from({ length: 9 }, (_, index) => ({
+      pageId: `concepts/cancel-page-${String(index).padStart(2, "0")}`,
+      title: `Cancel page ${index}`,
+      body: `Compiled cancellation marker ${index}.`,
+    }));
+    const engine = new CompiledPageEngine(pages);
+    const controller = new AbortController();
+    let batchCalls = 0;
+    const cancellingFactory: EmbeddingClientFactory = (profile) => ({
+      kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+      model: profile.model,
+      async embedDocuments(inputs) {
+        batchCalls += 1;
+        controller.abort();
+        return inputs.map(() => [1, 0]);
+      },
+      async embedQuery() {
+        return [1, 0];
+      },
+    });
+
+    await expect(
+      buildProject(fixture.root, {
+        engine,
+        environment: fixture.environment,
+        embeddingClientFactory: cancellingFactory,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "BUILD_CANCELLED" });
+    expect(batchCalls).toBe(1);
+
+    const resumedDocuments: string[] = [];
+    await buildProject(fixture.root, {
+      engine,
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory(resumedDocuments),
+    });
+    expect(resumedDocuments).toHaveLength(1);
+    expect(resumedDocuments[0]).toContain("Compiled cancellation marker 8.");
+  });
+
+  it("recovers a zero-byte cache left by a hard interruption", async () => {
+    const fixture = await semanticProject();
+    const indexFile = projectPaths(fixture.root).semanticIndex;
+    await mkdir(path.dirname(indexFile), { recursive: true });
+    await writeFile(indexFile, "");
+    const observedDocuments: string[] = [];
+
+    const result = await buildProject(fixture.root, {
+      engine: new DeterministicSourceEngine(),
+      environment: fixture.environment,
+      embeddingClientFactory: recordingSemanticFactory(observedDocuments),
+    });
+    const manifest = JSON.parse(
+      await readFile(
+        path.join(
+          fixture.root,
+          ".llm-wiki",
+          "generations",
+          result.generation,
+          "manifest.json",
+        ),
+        "utf8",
+      ),
+    ) as GenerationManifest;
+
+    expect(observedDocuments.length).toBeGreaterThan(0);
+    expect(manifest.semantic.available).toBe(true);
+  });
+
   it("builds a real index with a distinct embedding profile and key", async () => {
     const fixture = await semanticProject();
     const observedSecrets: string[] = [];
@@ -51,10 +458,6 @@ describe("semantic build boundary", () => {
     const manifest = JSON.parse(
       await readFile(path.join(generationRoot, "manifest.json"), "utf8"),
     ) as GenerationManifest;
-    const semanticIndex = JSON.parse(
-      await readFile(path.join(generationRoot, "semantic", "index.json"), "utf8"),
-    ) as { entries: unknown[] };
-
     expect(observedSecrets).toEqual(["embedding-secret"]);
     expect(manifest.semantic).toMatchObject({
       enabled: true,
@@ -66,7 +469,7 @@ describe("semantic build boundary", () => {
       reason: "Semantic index is available.",
     });
     expect(manifest.semantic.profileFingerprint).toMatch(/^[a-f0-9]{64}$/u);
-    expect(semanticIndex.entries.length).toBeGreaterThan(0);
+    expect(manifest.pages?.length).toBeGreaterThan(0);
     expect(JSON.stringify(manifest)).not.toContain("generation-secret");
     expect(JSON.stringify(manifest)).not.toContain("embedding-secret");
     expect(await getProjectStatus(fixture.root)).toMatchObject({
@@ -299,6 +702,26 @@ describe("semantic build boundary", () => {
 });
 
 describe("semantic query path", () => {
+  it("does not create or initialize a missing cache during a read", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "llm-wiki-semantic-readonly-"),
+    );
+    roots.push(root);
+    const indexFile = projectPaths(root).semanticIndex;
+
+    await expect(
+      readSemanticIndex(indexFile, [], {
+        profile: "embedding",
+        kind: "voyage",
+        model: "voyage-3",
+        profileFingerprint: "f".repeat(64),
+      }),
+    ).resolves.toBeNull();
+    await expect(readFile(indexFile, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("uses the generation's embedding profile and returns semantic evidence first", async () => {
     const fixture = await semanticProject();
     const observedSecrets: string[] = [];
@@ -309,11 +732,20 @@ describe("semantic query path", () => {
       embeddingClientFactory: factory,
     });
 
+    const semanticDirectory = path.dirname(
+      projectPaths(fixture.root).semanticIndex,
+    );
+    const filesBeforeRead = (await readdir(semanticDirectory)).sort();
     const result = await exploreWiki(fixture.root, "conceptually related", {
       environment: fixture.environment,
       embeddingClientFactory: factory,
     });
+    const filesAfterRead = (await readdir(semanticDirectory)).sort();
     expect(observedSecrets).toEqual(["embedding-secret", "embedding-secret"]);
+    expect(filesAfterRead).toEqual(filesBeforeRead);
+    expect(
+      filesAfterRead.some((file) => /-(?:journal|shm|wal)$/u.test(file)),
+    ).toBe(false);
     expect(result.status.semantic).toBe("available");
     expect(result.status.semanticReasonCode).toBe("SEMANTIC_READY");
     expect(result.evidence[0]).toMatchObject({
@@ -325,6 +757,31 @@ describe("semantic query path", () => {
         },
       },
     });
+  });
+
+  it("rejects a sidecar symlink without modifying its target", async () => {
+    const fixture = await semanticProject();
+    const factory = semanticFactory();
+    await buildProject(fixture.root, {
+      engine: new DeterministicSourceEngine(),
+      environment: fixture.environment,
+      embeddingClientFactory: factory,
+    });
+    const indexFile = projectPaths(fixture.root).semanticIndex;
+    const sentinel = path.join(fixture.root, "sidecar-sentinel.txt");
+    const sidecar = `${indexFile}-shm`;
+    await writeFile(sentinel, "safe");
+    await symlink(sentinel, sidecar, "file");
+
+    const result = await exploreWiki(fixture.root, "stable lexical marker", {
+      environment: fixture.environment,
+      embeddingClientFactory: factory,
+    });
+
+    expect(result.status.semantic).toBe("unavailable");
+    expect(result.status.semanticReasonCode).toBe("SEMANTIC_INDEX_INVALID");
+    expect(result.evidence[0]?.retrieval).toBe("lexical");
+    expect(await readFile(sentinel, "utf8")).toBe("safe");
   });
 
   it("degrades to lexical evidence with a stable reason when the embedding key is missing", async () => {
@@ -504,4 +961,81 @@ function semanticFactory(observedSecrets: string[] = []): EmbeddingClientFactory
       },
     };
   };
+}
+
+interface TestCompiledPage {
+  pageId: string;
+  title: string;
+  body: string;
+}
+
+class CompiledPageEngine implements WikiEngine {
+  readonly inputs: EngineBuildInput[] = [];
+
+  constructor(private readonly pages: TestCompiledPage[]) {}
+
+  async build(input: EngineBuildInput): Promise<EngineBuildResult> {
+    this.inputs.push(input);
+    const wikiRoot = path.join(input.generationRoot, "engine", "wiki");
+    await mkdir(wikiRoot, { recursive: true });
+    const source = input.proxies[0];
+    if (source === undefined) {
+      throw new Error("test engine requires one source proxy");
+    }
+    const engineSourceFile = `${source.proxyId}.md`;
+    for (const page of this.pages) {
+      const target = path.join(wikiRoot, `${page.pageId}.md`);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(
+        target,
+        `---\ntitle: ${page.title}\n---\n\n${page.body} ^[${engineSourceFile}:1]\n`,
+      );
+    }
+    await writeFile(path.join(wikiRoot, "index.md"), "# Wiki index\n");
+    return {
+      name: "test-compiled-page-engine",
+      version: "1",
+      pageCount: this.pages.length,
+      sourceMappings: input.proxies.map((proxy) => ({
+        proxyId: proxy.proxyId,
+        engineSourceFile,
+        engineBodyStartLine: 1,
+      })),
+      compiledPages: this.pages.map((page) => ({
+        ...page,
+        relativePath: `wiki/${page.pageId}.md`,
+      })),
+    };
+  }
+}
+
+function recordingSemanticFactory(
+  observedDocuments: string[],
+): EmbeddingClientFactory {
+  return (profile): EmbeddingClient => ({
+    kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+    model: profile.model,
+    async embedDocuments(inputs) {
+      observedDocuments.push(...inputs);
+      return inputs.map(() => [1, 0]);
+    },
+    async embedQuery() {
+      return [1, 0];
+    },
+  });
+}
+
+function directionalSemanticFactory(): EmbeddingClientFactory {
+  return (profile): EmbeddingClient => ({
+    kind: profile.kind === "voyage" ? "voyage" : "openai-compatible",
+    model: profile.model,
+    async embedDocuments(inputs) {
+      return inputs.map((input) =>
+        input.includes("Historical coordinator details") ? [1, 0] : [0, 1],
+      );
+    },
+    async embedQuery(input) {
+      return input.includes("semantic-recall-probe") ? [1, 0] : [0, 1];
+    },
+  });
 }

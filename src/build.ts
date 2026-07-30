@@ -5,9 +5,9 @@ import path from "node:path";
 import { readProjectConfig, readConsent, findProviderProfile } from "./config.js";
 import { credentialStoreForProfile } from "./credentials.js";
 import {
-  buildSemanticIndex,
+  createEmbeddingClient,
   embeddingProfileFingerprint,
-  readSemanticIndex,
+  type EmbeddingClient,
   type EmbeddingClientFactory,
 } from "./embedding.js";
 import { asLlmWikiError, LlmWikiError } from "./errors.js";
@@ -20,8 +20,18 @@ import {
   writeJsonAtomic,
 } from "./fs-utils.js";
 import { projectPaths } from "./paths.js";
+import { selectIncrementalPageCandidates } from "./incremental.js";
+import {
+  catalogCompiledWikiPages,
+  type CompiledWikiPage,
+} from "./pages.js";
 import { prepareSourceProxies } from "./proxy.js";
 import { enumerateAuthorizedSources } from "./scope.js";
+import {
+  buildSemanticIndex,
+  readSemanticIndex,
+  type SemanticIndexIdentity,
+} from "./semantic-cache.js";
 import { readCurrent, writeCurrent, writeStatus } from "./state.js";
 import {
   STATE_SCHEMA_VERSION,
@@ -38,6 +48,7 @@ export interface BuildOptions {
   engine?: WikiEngine;
   environment?: NodeJS.ProcessEnv;
   embeddingClientFactory?: EmbeddingClientFactory;
+  signal?: AbortSignal;
 }
 
 export interface BuildResult {
@@ -64,6 +75,7 @@ export async function buildProject(
     ensurePrivateDirectory(paths.locks),
     ensurePrivateDirectory(paths.builds),
     ensurePrivateDirectory(paths.generations),
+    ensurePrivateDirectory(paths.semantic),
   ]);
   const lock = await acquireFileLock(paths.buildLock);
   let currentBefore: CurrentPointer | null = null;
@@ -101,7 +113,7 @@ export async function buildProject(
       const generation = await nextGenerationId(root, sourceDigest);
       await ensurePrivateDirectory(stagingRoot);
       let previousProxies: ProxyRecord[] | undefined;
-      let previousSemanticIndex: SemanticIndex | null = null;
+      let previousPages: CompiledWikiPage[] = [];
       if (currentBefore !== null) {
         const previousRoot = path.join(
           paths.generations,
@@ -111,9 +123,13 @@ export async function buildProject(
           path.join(previousRoot, "manifest.json"),
         );
         previousProxies = previousManifest.proxies;
-        previousSemanticIndex = config.semantic.enabled
-          ? await readReusableSemanticIndex(previousRoot)
-          : null;
+        previousPages = await catalogCompiledWikiPages(
+          previousRoot,
+          previousManifest.proxies,
+          new Set(sources.map((source) => source.sourceId)),
+          undefined,
+          previousManifest.pages,
+        );
         const previousEngine = path.join(previousRoot, "engine");
         if (await pathExists(previousEngine)) {
           await cp(previousEngine, path.join(stagingRoot, "engine"), {
@@ -142,6 +158,47 @@ export async function buildProject(
             environment,
           )
         : null;
+      let embeddingClient: EmbeddingClient | null = null;
+      let previousSemanticIndex: SemanticIndex | null = null;
+      if (
+        semanticSetup !== null &&
+        semanticSetup.embeddingSecret !== null
+      ) {
+        embeddingClient = (
+          options.embeddingClientFactory ?? createEmbeddingClient
+        )(
+          semanticSetup.embeddingProfile,
+          semanticSetup.embeddingSecret,
+        );
+        if (
+          embeddingClient.kind !== semanticSetup.embeddingProfile.kind ||
+          embeddingClient.model !== semanticSetup.embeddingProfile.model
+        ) {
+          throw new LlmWikiError(
+            "EMBEDDING_CLIENT_PROFILE_MISMATCH",
+            "Embedding client does not match the selected embedding profile.",
+          );
+        }
+        if (previousPages.length > 0) {
+          const identity = semanticIdentity(semanticSetup.embeddingProfile);
+          try {
+            previousSemanticIndex = await readSemanticIndex(
+              paths.semanticIndex,
+              previousPages,
+              identity,
+            );
+          } catch (error) {
+            if (
+              !(
+                error instanceof LlmWikiError &&
+                error.code === "SEMANTIC_INDEX_INVALID"
+              )
+            ) {
+              throw error;
+            }
+          }
+        }
+      }
       let engine = options.engine;
       if (engine === undefined) {
         if (provider === null) {
@@ -168,10 +225,28 @@ export async function buildProject(
           ));
         engine = new CompilerWikiEngine(provider, secret);
       }
+      const candidateSelection =
+        previousProxies === undefined
+          ? {
+              candidates: [],
+              semanticFailure: null,
+              invalidateSemanticIndex: false,
+            }
+          : await selectIncrementalPageCandidates({
+              generationRoot: stagingRoot,
+              currentProxies: prepared.proxies,
+              previousProxies,
+              previousPages,
+              semanticIndex: previousSemanticIndex,
+              embeddingClient,
+            });
       const engineResult = await engine.build({
         generationRoot: stagingRoot,
         proxies: prepared.proxies,
         ...(previousProxies === undefined ? {} : { previousProxies }),
+        ...(candidateSelection.candidates.length === 0
+          ? {}
+          : { previousPageCandidates: candidateSelection.candidates }),
       });
       const mappingByProxy = new Map(
         engineResult.sourceMappings.map(
@@ -192,23 +267,36 @@ export async function buildProject(
           engineBodyStartLine: mapping.engineBodyStartLine,
         };
       });
+      const pages = await catalogCompiledWikiPages(
+        stagingRoot,
+        mappedProxies,
+        new Set(sources.map((source) => source.sourceId)),
+        engineResult.compiledPages,
+      );
       let semanticIndex: SemanticIndex | null = null;
-      let semanticUnavailable = semanticSetup?.unavailable ?? null;
+      let semanticUnavailable =
+        candidateSelection.semanticFailure ??
+        semanticSetup?.unavailable ??
+        null;
       if (
         semanticSetup !== null &&
-        semanticSetup.embeddingSecret !== null
+        semanticSetup.embeddingSecret !== null &&
+        embeddingClient !== null &&
+        semanticUnavailable === null
       ) {
         try {
           semanticIndex = await buildSemanticIndex(
-            stagingRoot,
-            mappedProxies,
+            paths.semanticIndex,
+            pages,
             semanticSetup.embeddingProfile,
             semanticSetup.embeddingSecret,
             {
-              ...(options.embeddingClientFactory === undefined
+              clientFactory: () => embeddingClient,
+              recoverCorrupt: true,
+              forceRebuild: candidateSelection.invalidateSemanticIndex,
+              ...(options.signal === undefined
                 ? {}
-                : { clientFactory: options.embeddingClientFactory }),
-              previousIndex: previousSemanticIndex,
+                : { signal: options.signal }),
             },
           );
         } catch (error) {
@@ -257,7 +345,7 @@ export async function buildProject(
                 semanticUnavailable === null
                   ? semanticAvailable
                     ? "Semantic index is available."
-                    : "No embeddable source chunks were produced."
+                    : "No embeddable compiled Wiki pages were produced."
                   : semanticUnavailableReason(semanticUnavailable.code),
             }
           : {
@@ -287,10 +375,11 @@ export async function buildProject(
         })),
         unsupported: prepared.unsupported,
         proxies: mappedProxies,
+        pages: pages.map(({ body: _body, ...page }) => page),
       };
       await writeJsonAtomic(path.join(stagingRoot, "manifest.json"), manifest);
       await hardenPrivateTree(stagingRoot);
-      await validateGeneration(stagingRoot, manifest);
+      await validateGeneration(stagingRoot);
 
       uncommittedPublishedRoot = path.join(paths.generations, generation);
       await ensurePrivateDirectory(paths.generations);
@@ -551,22 +640,6 @@ function secretsMatch(left: string, right: string): boolean {
   );
 }
 
-async function readReusableSemanticIndex(
-  generationRoot: string,
-): Promise<SemanticIndex | null> {
-  try {
-    return await readSemanticIndex(generationRoot);
-  } catch (error) {
-    if (
-      error instanceof LlmWikiError &&
-      error.code === "SEMANTIC_INDEX_INVALID"
-    ) {
-      return null;
-    }
-    throw error;
-  }
-}
-
 async function nextGenerationId(root: string, sourceDigest: string): Promise<string> {
   const paths = projectPaths(root);
   await ensurePrivateDirectory(paths.generations);
@@ -581,20 +654,29 @@ async function nextGenerationId(root: string, sourceDigest: string): Promise<str
 
 async function validateGeneration(
   generationRoot: string,
-  manifest: GenerationManifest,
 ): Promise<void> {
   const required = [
     path.join(generationRoot, "manifest.json"),
     path.join(generationRoot, "engine", "wiki", "index.md"),
-    ...(manifest.semantic.available
-      ? [path.join(generationRoot, "semantic", "index.json")]
-      : []),
   ];
   for (const target of required) {
     if (!(await pathExists(target))) {
       throw new LlmWikiError("INVALID_GENERATION", `Generation is missing ${path.basename(target)}.`);
     }
   }
+}
+
+function semanticIdentity(
+  profile: ProviderProfile & {
+    kind: "openai-compatible" | "voyage";
+  },
+): SemanticIndexIdentity {
+  return {
+    profile: profile.name,
+    kind: profile.kind,
+    model: profile.model,
+    profileFingerprint: embeddingProfileFingerprint(profile),
+  };
 }
 
 async function garbageCollectGenerations(

@@ -13,6 +13,8 @@ export interface ProjectPaths {
   watcherLock: string;
   builds: string;
   generations: string;
+  semantic: string;
+  semanticIndex: string;
 }
 
 export function projectPaths(root: string): ProjectPaths {
@@ -30,5 +32,7 @@ export function projectPaths(root: string): ProjectPaths {
     watcherLock: path.join(localRoot, "locks", "watcher.lock"),
     builds: path.join(localRoot, "builds"),
     generations: path.join(localRoot, "generations"),
+    semantic: path.join(localRoot, "semantic"),
+    semanticIndex: path.join(localRoot, "semantic", "index.sqlite"),
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "@autocut-cli/llm-wiki",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "A local, citation-aware LLM Wiki builder with a single-tool MCP interface.",
   "type": "module",
   "license": "MIT",

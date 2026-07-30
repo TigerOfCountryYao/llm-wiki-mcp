@@ -71,10 +71,19 @@ Production builds use an exact-pinned reviewed `llm-wiki-compiler` fork.
 It adds native `compile({ embeddings: false, systemPolicy })` support and source
 deletion reconciliation. Tests inject a deterministic engine.
 
-Semantic retrieval is off by default. When enabled, it uses a generation-local
-index over stable source-proxy chunks; it does not ask the compiler to perform a
-second embedding pass. The embedding client supports OpenAI-compatible and
-Voyage endpoints.
+Semantic retrieval is off by default. When enabled, it uses a private SQLite
+derived cache over compiled Wiki pages only; raw source proxies are never the
+search corpus. Completed page batches are committed immediately, so a later
+provider failure or cancelled build can resume without resending completed
+pages. The embedding client supports OpenAI-compatible and Voyage endpoints.
+
+During an incremental build, the remote embedding provider may receive a
+strictly length-bounded query containing the topic, source locator, and a short
+new-evidence excerpt from the user-confirmed source scope. This query is used
+only to recall existing compiled pages and is not added to the searchable
+corpus. No automatic secret-pattern redaction is claimed: enabling semantic
+retrieval authorizes this bounded query egress to the selected independent
+provider.
 
 Semantic mode requires an explicit embedding profile whose name and credential
 both differ from the Wiki generation profile and credential. The generation key
@@ -95,9 +104,10 @@ llm-wiki semantic enable --root /project
 llm-wiki build --root /project
 ```
 
-At query time, a missing or changed embedding profile, missing credential, bad
-index, or provider failure produces a stable semantic reason code and falls
-back to lexical retrieval from the last good generation.
+At build and query time, a missing or changed embedding profile, missing
+credential, bad index, or provider failure produces a stable semantic reason
+code and falls back to lexical retrieval from compiled Wiki pages in the last
+good generation.
 
 `serve` is strictly read-only and exits with its stdio client. Automatic builds
 run only under the explicit `llm-wiki watch --root <project>` process; a query
