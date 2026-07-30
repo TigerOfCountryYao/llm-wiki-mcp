@@ -42,6 +42,9 @@ starts with `.` and every Git-ignored file are excluded.
 If Git metadata is present but Git cannot verify the repository scope,
 cataloging, status verification, and builds fail closed with
 `GIT_SCOPE_UNAVAILABLE`; they never fall back to broader filesystem traversal.
+If a build process is interrupted, the next status check reclaims its
+dead-owner lock and reports `BUILD_INTERRUPTED`, so rebuilding can resume
+immediately.
 
 Interactive `init` uses a first-level checklist: Up/Down moves, Space toggles,
 Enter confirms, and Escape cancels. Non-interactive callers must pass both

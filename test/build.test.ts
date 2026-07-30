@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -132,6 +133,50 @@ describe("immutable generation builds", () => {
     await first;
   });
 
+  it("recovers an interrupted subprocess build without waiting for lock expiry", async () => {
+    const root = await projectWithSource();
+    await buildProject(root, { engine: new DeterministicSourceEngine() });
+    await writeFile(path.join(root, "docs", "guide.md"), "changed before interruption\n");
+    const buildModule = new URL("../dist/build.js", import.meta.url).href;
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `import { buildProject } from ${JSON.stringify(buildModule)};
+         await buildProject(process.env.LLM_WIKI_TEST_ROOT, {
+           engine: { async build() { await new Promise(() => {}); } }
+         });`,
+      ],
+      {
+        env: { ...process.env, LLM_WIKI_TEST_ROOT: root },
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    try {
+      await waitForBuildingStatus(root);
+      child.kill();
+      await waitForChildExit(child);
+
+      expect(await getProjectStatus(root)).toMatchObject({
+        state: "stale",
+        reasonCode: "BUILD_INTERRUPTED",
+      });
+      await expect(
+        readFile(path.join(root, ".llm-wiki", "locks", "build.lock")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        buildProject(root, { engine: new DeterministicSourceEngine() }),
+      ).resolves.toMatchObject({ sourceCount: 1 });
+    } finally {
+      if (child.exitCode === null) {
+        child.kill();
+        await waitForChildExit(child);
+      }
+    }
+  }, 15_000);
+
   it("releases the build lock when current state cannot be read", async () => {
     const root = await projectWithSource();
     await writeFile(
@@ -246,4 +291,31 @@ async function waitForFile(target: string): Promise<void> {
     }
   }
   throw new Error(`Timed out waiting for ${target}`);
+}
+
+async function waitForBuildingStatus(root: string): Promise<void> {
+  const statusPath = path.join(root, ".llm-wiki", "status.json");
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      const status = JSON.parse(await readFile(statusPath, "utf8")) as {
+        state?: unknown;
+      };
+      if (status.state === "building") {
+        return;
+      }
+    } catch {
+      // The subprocess may not have written its first status yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for building status in ${root}`);
+}
+
+async function waitForChildExit(
+  child: ReturnType<typeof spawn>,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 }

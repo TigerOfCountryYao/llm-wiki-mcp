@@ -1,9 +1,13 @@
 import path from "node:path";
-import { pathExists, readJsonFile } from "./fs-utils.js";
+import {
+  pathExists,
+  readJsonFile,
+  recoverOrphanedFileLock,
+} from "./fs-utils.js";
 import { projectPaths } from "./paths.js";
 import { readConsent } from "./config.js";
 import { enumerateAuthorizedSources } from "./scope.js";
-import { readCurrent, readStoredStatus } from "./state.js";
+import { readCurrent, readStoredStatus, writeStatus } from "./state.js";
 import {
   STATE_SCHEMA_VERSION,
   type GenerationManifest,
@@ -43,11 +47,28 @@ export async function getProjectStatus(
   }
 
   const verifySources = options.verifySources ?? true;
-  const [consent, current, stored] = await Promise.all([
+  const [consent, current, storedValue] = await Promise.all([
     verifySources ? readConsent(root) : Promise.resolve(null),
     readCurrent(root),
     readStoredStatus(root),
   ]);
+  let stored = storedValue;
+  if (stored?.state === "building") {
+    const lockState = await recoverOrphanedFileLock(paths.buildLock);
+    if (lockState !== "active") {
+      stored = {
+        schemaVersion: STATE_SCHEMA_VERSION,
+        state: "stale",
+        updatedAt: new Date().toISOString(),
+        reasonCode: "BUILD_INTERRUPTED",
+        message: "The previous Wiki build was interrupted and can be retried.",
+        ...(current === null
+          ? {}
+          : { currentGeneration: current.generation }),
+      };
+      await writeStatus(root, stored);
+    }
+  }
   const enumerated =
     consent === null
       ? null
@@ -96,12 +117,13 @@ export async function getProjectStatus(
     stored !== null &&
     Date.parse(stored.updatedAt) > Date.parse(current.builtAt);
   const faultApplies =
+    stored !== null &&
     storedTargetsCurrent &&
     storedIsLater &&
     (stored.state === "building" ||
       stored.state === "error" ||
       stored.state === "provider-unavailable");
-  if (faultApplies) {
+  if (faultApplies && stored !== null) {
     return {
       ...base,
       state: stored.state,
@@ -113,10 +135,11 @@ export async function getProjectStatus(
   }
 
   const explicitStaleApplies =
+    stored !== null &&
     storedTargetsCurrent &&
-    stored?.state === "stale" &&
+    stored.state === "stale" &&
     Date.parse(stored.updatedAt) >= Date.parse(current.builtAt);
-  if (explicitStaleApplies) {
+  if (explicitStaleApplies && stored !== null) {
     return {
       ...base,
       state: "stale",

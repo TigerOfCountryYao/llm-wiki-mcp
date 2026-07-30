@@ -179,6 +179,8 @@ export interface FileLock {
   release(): Promise<void>;
 }
 
+export type FileLockState = "absent" | "active" | "recovered";
+
 export async function acquireFileLock(
   lockPath: string,
   staleAfterMs = 30 * 60 * 1000,
@@ -208,15 +210,8 @@ export async function acquireFileLock(
         throw error;
       }
 
-      const lockStat = await stat(lockPath).catch(() => null);
-      const ownerAlive = await lockOwnerIsAlive(lockPath);
-      if (
-        attempt === 0 &&
-        lockStat !== null &&
-        ownerAlive === false &&
-        Date.now() - lockStat.mtimeMs > staleAfterMs
-      ) {
-        await rm(lockPath, { force: true });
+      const state = await recoverOrphanedFileLock(lockPath, staleAfterMs);
+      if (attempt === 0 && state !== "active") {
         continue;
       }
       throw new LlmWikiError("BUILD_LOCKED", "Another LLM Wiki build is already running.");
@@ -224,6 +219,29 @@ export async function acquireFileLock(
   }
 
   throw new LlmWikiError("BUILD_LOCKED", "Another LLM Wiki build is already running.");
+}
+
+export async function recoverOrphanedFileLock(
+  lockPath: string,
+  staleAfterMs = 30 * 60 * 1000,
+): Promise<FileLockState> {
+  let lockStat;
+  try {
+    lockStat = await stat(lockPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return "absent";
+    }
+    throw error;
+  }
+  const ownerAlive = await lockOwnerIsAlive(lockPath);
+  const malformedAndStale =
+    ownerAlive === null && Date.now() - lockStat.mtimeMs > staleAfterMs;
+  if (ownerAlive === false || malformedAndStale) {
+    await rm(lockPath, { force: true });
+    return "recovered";
+  }
+  return "active";
 }
 
 async function lockOwnerIsAlive(lockPath: string): Promise<boolean | null> {
