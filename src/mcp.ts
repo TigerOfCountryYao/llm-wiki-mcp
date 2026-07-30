@@ -2,11 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { exploreWiki } from "./explore.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 export async function startMcpServer(root: string): Promise<void> {
   const server = new McpServer({
     name: "llm-wiki",
-    version: "0.1.0",
+    version: PACKAGE_VERSION,
   });
 
   server.registerTool(

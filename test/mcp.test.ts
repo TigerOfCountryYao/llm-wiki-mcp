@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildProject } from "../src/build.js";
 import { DeterministicSourceEngine } from "../src/engine.js";
 import { initializeProject } from "../src/project.js";
+import { PACKAGE_VERSION } from "../src/version.js";
 
 const roots: string[] = [];
 
@@ -30,6 +31,10 @@ describe("stdio MCP surface", () => {
     const client = new Client({ name: "llm-wiki-test", version: "1.0.0" });
     try {
       await client.connect(transport);
+      expect(client.getServerVersion()).toEqual({
+        name: "llm-wiki",
+        version: PACKAGE_VERSION,
+      });
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual(["wiki_explore"]);
       expect(Object.keys(listed.tools[0]!.inputSchema.properties ?? {}).sort()).toEqual([

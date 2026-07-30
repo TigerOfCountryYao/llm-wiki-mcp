@@ -53,6 +53,7 @@ export {
 } from "./scope.js";
 export { getProjectStatus, type ProjectStatusResult } from "./status.js";
 export { startWatcherLeader, type WatcherHandle } from "./watcher.js";
+export { PACKAGE_VERSION } from "./version.js";
 export type {
   CatalogEntry,
   CatalogResult,

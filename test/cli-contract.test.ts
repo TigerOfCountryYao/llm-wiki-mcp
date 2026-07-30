@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { runCli, type CliIo } from "../src/cli.js";
 import { readProjectConfig, writeProjectConfig } from "../src/config.js";
 import { initializeProject } from "../src/project.js";
+import { PACKAGE_VERSION } from "../src/version.js";
 
 const roots: string[] = [];
 
@@ -16,6 +17,22 @@ afterEach(async () => {
 });
 
 describe("CLI configuration contracts", () => {
+  it("reports the package version in version and help output", async () => {
+    const version = await invokeCli(["--version"]);
+    expect(version).toEqual({
+      exitCode: 0,
+      stdout: `${PACKAGE_VERSION}\n`,
+      stderr: "",
+    });
+
+    const help = await invokeCli(["--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stderr).toBe("");
+    expect(help.stdout).toMatch(
+      new RegExp(`^llm-wiki ${PACKAGE_VERSION.replaceAll(".", "\\.")}\\n`),
+    );
+  });
+
   it("reports both active project profiles from semantic status", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-cli-contract-"));
     roots.push(root);

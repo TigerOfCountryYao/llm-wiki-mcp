@@ -34,6 +34,7 @@ import { markStale } from "./state.js";
 import { getProjectStatus } from "./status.js";
 import { startWatcherLeader } from "./watcher.js";
 import type { CommandEnvelope, ProviderKind } from "./types.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 export interface CliIo {
   stdin: NodeJS.ReadableStream;
@@ -168,7 +169,7 @@ export async function runCli(argv: string[], io: CliIo = defaultIo): Promise<num
       case "version":
       case "--version":
       case "-v":
-        writeText(io.stdout, "0.1.0\n");
+        writeText(io.stdout, `${PACKAGE_VERSION}\n`);
         return 0;
       default:
         throw new LlmWikiError("UNKNOWN_COMMAND", `Unknown command: ${command}`);
@@ -456,7 +457,7 @@ function writeText(output: NodeJS.WritableStream, text: string): void {
 }
 
 function helpText(): string {
-  return `llm-wiki 0.1.0
+  return `llm-wiki ${PACKAGE_VERSION}
 
 Usage:
   llm-wiki catalog --root <project> [--json]

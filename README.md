@@ -18,7 +18,7 @@ structured knowledge updates. Agents querying over MCP cannot mutate the wiki.
 ## Quick start
 
 ```sh
-npm install --global @autocut-cli/llm-wiki@0.1.0
+npm install --global @autocut-cli/llm-wiki
 llm-wiki catalog --root /path/to/project --json
 llm-wiki init --root /path/to/project --select README.md --yes --json
 llm-wiki provider set wiki-generation \
