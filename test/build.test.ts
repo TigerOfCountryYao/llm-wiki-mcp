@@ -177,6 +177,30 @@ describe("immutable generation builds", () => {
     });
   });
 
+  it("can read the committed status without rescanning changed sources", async () => {
+    const root = await projectWithSource();
+    const built = await buildProject(root, {
+      engine: new DeterministicSourceEngine(),
+    });
+    await writeFile(
+      path.join(root, "docs", "guide.md"),
+      "changed after the committed generation\n",
+    );
+
+    expect(
+      await getProjectStatus(root, { verifySources: false }),
+    ).toMatchObject({
+      state: "ready",
+      sourceCount: 1,
+      sourceDigest: built.sourceDigest,
+      currentGeneration: built.generation,
+    });
+    expect(await getProjectStatus(root)).toMatchObject({
+      state: "stale",
+      reasonCode: "SOURCES_CHANGED",
+    });
+  });
+
   it("ignores a stored build failure older than the current commit", async () => {
     const root = await projectWithSource();
     const built = await buildProject(root, {

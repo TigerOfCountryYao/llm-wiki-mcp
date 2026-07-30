@@ -91,6 +91,11 @@ back to lexical retrieval from the last good generation.
 run only under the explicit `llm-wiki watch --root <project>` process; a query
 never starts a build.
 
+`status` verifies the approved source scope by default. Polling integrations can
+use `status --fast` to read the committed generation and runtime state without
+rescanning or hashing project files; their watcher remains responsible for
+marking source changes stale.
+
 ## Client registration
 
 `llm-wiki install` and `llm-wiki uninstall` delegate registration to the

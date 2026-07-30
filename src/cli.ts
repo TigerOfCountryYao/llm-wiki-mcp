@@ -98,7 +98,9 @@ export async function runCli(argv: string[], io: CliIo = defaultIo): Promise<num
         data = await uninitializeProject(root);
         break;
       case "status":
-        data = await getProjectStatus(root);
+        data = await getProjectStatus(root, {
+          verifySources: !parsed.flags.has("fast"),
+        });
         break;
       case "build":
         data = await buildProject(root, { environment: io.environment });
@@ -212,7 +214,7 @@ class ParsedArguments {
 
 function parseArguments(argv: string[]): ParsedArguments {
   const parsed = new ParsedArguments();
-  const booleanFlags = new Set(["json", "yes", "key-stdin"]);
+  const booleanFlags = new Set(["fast", "json", "yes", "key-stdin"]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
     if (!argument.startsWith("--")) {
@@ -460,7 +462,8 @@ Usage:
   llm-wiki catalog --root <project> [--json]
   llm-wiki install|uninstall [--client claude|codex|hermes|all] [--json]
   llm-wiki init --root <project> [--select <first-level>]... [--yes] [--json]
-  llm-wiki status|build|doctor|uninit --root <project> [--json]
+  llm-wiki status --root <project> [--fast] [--json]
+  llm-wiki build|doctor|uninit --root <project> [--json]
   llm-wiki upsert|delete --root <project> --json < input.json
   llm-wiki provider list [--json]
   llm-wiki provider set <name> --kind <kind> --model <model>

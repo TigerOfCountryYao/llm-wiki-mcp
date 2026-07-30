@@ -21,7 +21,14 @@ export interface ProjectStatusResult extends RuntimeStatus {
   semantic?: GenerationSemanticStatus;
 }
 
-export async function getProjectStatus(root: string): Promise<ProjectStatusResult> {
+export interface ProjectStatusOptions {
+  verifySources?: boolean;
+}
+
+export async function getProjectStatus(
+  root: string,
+  options: ProjectStatusOptions = {},
+): Promise<ProjectStatusResult> {
   const paths = projectPaths(root);
   if (!(await pathExists(paths.consent))) {
     return {
@@ -35,18 +42,22 @@ export async function getProjectStatus(root: string): Promise<ProjectStatusResul
     };
   }
 
+  const verifySources = options.verifySources ?? true;
   const [consent, current, stored] = await Promise.all([
-    readConsent(root),
+    verifySources ? readConsent(root) : Promise.resolve(null),
     readCurrent(root),
     readStoredStatus(root),
   ]);
-  const enumerated = await enumerateAuthorizedSources(root, consent);
-  const base = {
+  const enumerated =
+    consent === null
+      ? null
+      : await enumerateAuthorizedSources(root, consent);
+  const cachedBase = {
     schemaVersion: STATE_SCHEMA_VERSION,
     updatedAt: stored?.updatedAt ?? new Date().toISOString(),
     initialized: true,
-    sourceCount: enumerated.sources.length,
-    sourceDigest: enumerated.sourceDigest,
+    sourceCount: enumerated?.sources.length ?? 0,
+    ...(enumerated === null ? {} : { sourceDigest: enumerated.sourceDigest }),
   } as const;
 
   if (current === null) {
@@ -57,7 +68,7 @@ export async function getProjectStatus(root: string): Promise<ProjectStatusResul
         ? stored.state
         : "stale";
     return {
-      ...base,
+      ...cachedBase,
       state: preservedState,
       reasonCode: stored?.reasonCode ?? "NO_GENERATION",
       message: stored?.message ?? "No successful generation exists yet.",
@@ -68,6 +79,11 @@ export async function getProjectStatus(root: string): Promise<ProjectStatusResul
   const manifest = await readJsonFile<GenerationManifest>(
     path.join(paths.generations, current.generation, "manifest.json"),
   );
+  const base = {
+    ...cachedBase,
+    sourceCount: enumerated?.sources.length ?? manifest.sources.length,
+    sourceDigest: enumerated?.sourceDigest ?? manifest.sourceDigest,
+  } as const;
   const generationState = {
     currentGeneration: current.generation,
     builtAt: current.builtAt,
@@ -110,7 +126,10 @@ export async function getProjectStatus(root: string): Promise<ProjectStatusResul
     };
   }
 
-  if (current.sourceDigest !== enumerated.sourceDigest) {
+  if (
+    enumerated !== null &&
+    current.sourceDigest !== enumerated.sourceDigest
+  ) {
     return {
       ...base,
       state: "stale",
