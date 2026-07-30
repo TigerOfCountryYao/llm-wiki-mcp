@@ -92,4 +92,60 @@ describe("source scope", () => {
     expect(manifest.proxies).toEqual([]);
     expect(explored.evidence).toEqual([]);
   });
+
+  it("fails closed when Git scope cannot be verified inside a repository", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-git-unavailable-"));
+    roots.push(root);
+    await execFileAsync("git", ["init", "--quiet", root]);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, ".gitignore"), "docs/ignored.secret\n");
+    await writeFile(path.join(root, "docs", "guide.md"), "approved knowledge\n");
+    await writeFile(path.join(root, "docs", "ignored.secret"), "must never expand scope\n");
+    await initializeProject(root, ["docs"]);
+    await buildProject(root, { engine: new DeterministicSourceEngine() });
+    const consent = await readConsent(root);
+    const originalPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      await expect(catalogProject(root)).rejects.toMatchObject({
+        code: "GIT_SCOPE_UNAVAILABLE",
+      });
+      await expect(enumerateAuthorizedSources(root, consent)).rejects.toMatchObject({
+        code: "GIT_SCOPE_UNAVAILABLE",
+      });
+      await expect(getProjectStatus(root)).rejects.toMatchObject({
+        code: "GIT_SCOPE_UNAVAILABLE",
+      });
+      await expect(
+        buildProject(root, { engine: new DeterministicSourceEngine() }),
+      ).rejects.toMatchObject({
+        code: "GIT_SCOPE_UNAVAILABLE",
+      });
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+    }
+  });
+
+  it("still supports a true non-Git directory when Git is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-nongit-"));
+    roots.push(root);
+    await mkdir(path.join(root, "docs"));
+    await writeFile(path.join(root, "docs", "guide.md"), "local knowledge\n");
+    const originalPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      const catalog = await catalogProject(root);
+      expect(catalog.entries.map((entry) => entry.path)).toEqual(["docs"]);
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+    }
+  });
 });

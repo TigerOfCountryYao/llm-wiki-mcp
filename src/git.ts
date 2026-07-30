@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { appendFile, lstat, readFile, writeFile } from "node:fs/promises";
+import { LlmWikiError } from "./errors.js";
 import { isNodeError, pathExists } from "./fs-utils.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,10 +24,18 @@ async function git(
 }
 
 export async function isGitWorkTree(root: string): Promise<boolean> {
+  const metadataPresent = await hasGitMetadata(root);
   try {
     const result = await git(root, ["rev-parse", "--is-inside-work-tree"]);
-    return String(result).trim() === "true";
+    const insideWorkTree = String(result).trim() === "true";
+    if (!insideWorkTree && metadataPresent) {
+      throw gitScopeUnavailable();
+    }
+    return insideWorkTree;
   } catch {
+    if (metadataPresent) {
+      throw gitScopeUnavailable();
+    }
     return false;
   }
 }
@@ -35,19 +44,56 @@ export async function gitEligibleFiles(root: string): Promise<string[] | null> {
   if (!(await isGitWorkTree(root))) {
     return null;
   }
-  const output = (await git(root, [
-    "ls-files",
-    "-co",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ".",
-  ], "buffer")) as Buffer;
+  let output: Buffer;
+  try {
+    output = (await git(root, [
+      "ls-files",
+      "-co",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ".",
+    ], "buffer")) as Buffer;
+  } catch {
+    throw gitScopeUnavailable();
+  }
   return output
     .toString("utf8")
     .split("\0")
     .filter((item) => item !== "")
     .map((item) => item.replaceAll("\\", "/"));
+}
+
+async function hasGitMetadata(root: string): Promise<boolean> {
+  if (
+    String(process.env.GIT_DIR ?? "").trim() !== "" ||
+    String(process.env.GIT_WORK_TREE ?? "").trim() !== ""
+  ) {
+    return true;
+  }
+  let current = path.resolve(root);
+  while (true) {
+    try {
+      await lstat(path.join(current, ".git"));
+      return true;
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        throw gitScopeUnavailable();
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+function gitScopeUnavailable(): LlmWikiError {
+  return new LlmWikiError(
+    "GIT_SCOPE_UNAVAILABLE",
+    "Git source scope could not be verified; refusing to fall back to filesystem traversal.",
+  );
 }
 
 export async function localGitExcludePath(root: string): Promise<string | null> {
